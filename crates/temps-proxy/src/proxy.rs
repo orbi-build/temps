@@ -51,7 +51,7 @@ use crate::static_file_serving::{
 use crate::tls_fingerprint;
 use crate::traits::*;
 use async_trait::async_trait;
-use axum::http::{header, uri::Authority};
+use axum::http::{header, uri::Authority, HeaderValue};
 use bytes::Bytes;
 use cookie::Cookie;
 use pingora::http::StatusCode;
@@ -3290,6 +3290,57 @@ fn strip_untrusted_client_ip_headers(request: &mut RequestHeader) {
     request.remove_header("cf-connecting-ip");
 }
 
+/// Join every downstream `cookie` header field into one `Cookie` header for the
+/// upstream request, preserving field order and separating the values with
+/// `"; "` (RFC 9113 §8.2.3).
+///
+/// HTTP/2 clients may split a single cookie header into several `cookie` fields
+/// ("cookie crumbs"). Pingora forwards those fields verbatim, but an upstream
+/// HTTP/1.1 server keeps only the first duplicate `Cookie` line and silently
+/// drops the rest, so every cookie after the first is lost (gotempsh/temps#1141).
+/// RFC 9113 requires an intermediary converting HTTP/2 to HTTP/1.1 to
+/// concatenate them first, which is what this does.
+///
+/// A request with zero or one `cookie` field is left byte-for-byte untouched, as
+/// is every other header — only repeated `cookie` fields are joined.
+fn join_cookie_header_fields(upstream_request: &mut RequestHeader) -> Result<()> {
+    let values: Vec<HeaderValue> = upstream_request
+        .headers
+        .get_all(header::COOKIE)
+        .iter()
+        .cloned()
+        .collect();
+    if values.len() < 2 {
+        return Ok(());
+    }
+
+    // Header values are already free of CR/LF/NUL, so joining valid values with
+    // `"; "` is guaranteed to produce a valid value; rebuild the bytes directly
+    // rather than through `to_str` so a non-UTF8 cookie octet is not dropped.
+    let joined_len = values
+        .iter()
+        .map(|value| value.as_bytes().len())
+        .sum::<usize>()
+        + 2 * (values.len() - 1);
+    let mut joined = Vec::with_capacity(joined_len);
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            joined.extend_from_slice(b"; ");
+        }
+        joined.extend_from_slice(value.as_bytes());
+    }
+    let joined = HeaderValue::from_bytes(&joined).map_err(|error| {
+        Error::because(
+            pingora::ErrorType::InvalidHTTPHeader,
+            "joining the Cookie header fields",
+            error,
+        )
+    })?;
+
+    upstream_request.remove_header(&header::COOKIE);
+    upstream_request.insert_header(header::COOKIE, joined)
+}
+
 /// Whether a `Content-Type` value's media type — its "essence", the part
 /// before any `;` parameters — is exactly `text/event-stream`.
 ///
@@ -5973,6 +6024,18 @@ impl ProxyHttp for LoadBalancer {
         }
 
         Ok(false)
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut PingoraSession,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        join_cookie_header_fields(upstream_request)
     }
 
     async fn upstream_response_filter(
@@ -8720,6 +8783,211 @@ mod forwarded_authority_tests {
         assert_eq!(
             request.headers.get("x-unrelated"),
             Some(&HeaderValue::from_static("preserved"))
+        );
+    }
+}
+
+/// Tests for joining HTTP/2 split `cookie` fields into one upstream `Cookie`
+/// header (RFC 9113 §8.2.3).
+///
+/// The `ProxyHttp` filter itself needs a fully wired `LoadBalancer` and a
+/// `PingoraSession`, so the joining logic lives in the pure
+/// [`join_cookie_header_fields`] helper that the three-line filter delegates to.
+/// The last two tests serialize the joined request through the real HTTP/1
+/// upstream writer, which is exactly what the tenant app receives on the wire —
+/// once in the HTTP/1 downstream header-map shape and once in the HTTP/2 one.
+#[cfg(test)]
+mod cookie_header_tests {
+    use super::join_cookie_header_fields;
+    use pingora_http::RequestHeader;
+    use tokio::io::AsyncReadExt;
+
+    fn request_with_cookie_fields(fields: &[&str]) -> RequestHeader {
+        // `build` keeps the case-preserving header map, i.e. the same shape an
+        // HTTP/1 downstream request has; the helper must work for both.
+        let mut request =
+            RequestHeader::build("GET", b"/echo-cookies", None).expect("valid request header");
+        for field in fields {
+            request
+                .append_header("cookie", *field)
+                .expect("valid cookie header field");
+        }
+        request
+    }
+
+    /// The HTTP/2 downstream shape: Pingora turns the h2 header map into
+    /// `RequestHeader::from(http::request::Parts)`, which carries no
+    /// case-preserving map and keeps the split `cookie` fields as several values
+    /// under the one header name.
+    fn http2_request_with_cookie_fields(fields: &[&str]) -> RequestHeader {
+        let mut parts = axum::http::Request::builder()
+            .method("GET")
+            .uri("/echo-cookies")
+            .body(())
+            .expect("valid http request")
+            .into_parts()
+            .0;
+        for field in fields {
+            parts.headers.append(
+                "cookie",
+                axum::http::HeaderValue::from_str(field).expect("valid cookie header field"),
+            );
+        }
+        RequestHeader::from(parts)
+    }
+
+    /// The bytes the upstream receives, serialized by the real HTTP/1.1 client
+    /// writer.
+    async fn serialize_upstream_request(request: RequestHeader) -> String {
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let mut upstream = pingora_core::protocols::http::v1::client::HttpSession::new(Box::new(
+            writer,
+        )
+            as pingora_core::protocols::Stream);
+        upstream
+            .write_request_header(Box::new(request))
+            .await
+            .expect("serialize the upstream request header");
+
+        let mut serialized = vec![0u8; 4096];
+        let bytes_read = reader
+            .read(&mut serialized)
+            .await
+            .expect("read the serialized upstream request");
+        String::from_utf8_lossy(&serialized[..bytes_read]).into_owned()
+    }
+
+    /// Every `cookie` field value on the serialized wire, in order. Header field
+    /// names are case-insensitive (RFC 9110 §5.1), so match the name
+    /// case-insensitively but keep the value bytes exact.
+    fn serialized_cookie_values(serialized: &str) -> Vec<&str> {
+        serialized
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("cookie").then_some(value)
+            })
+            .map(str::trim_start)
+            .collect()
+    }
+
+    fn cookie_values(request: &RequestHeader) -> Vec<String> {
+        request
+            .headers
+            .get_all("cookie")
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .expect("test cookie value is ASCII")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn joins_three_cookie_fields_into_one_header() {
+        let mut request = request_with_cookie_fields(&["a=1", "b=2", "c=3"]);
+
+        join_cookie_header_fields(&mut request).expect("joining cookies cannot fail");
+
+        assert_eq!(
+            cookie_values(&request),
+            vec!["a=1; b=2; c=3"],
+            "the upstream must carry exactly one cookie field with every value in order"
+        );
+    }
+
+    #[test]
+    fn leaves_single_cookie_field_unchanged() {
+        let mut request = request_with_cookie_fields(&["a=1"]);
+
+        join_cookie_header_fields(&mut request).expect("joining cookies cannot fail");
+
+        assert_eq!(cookie_values(&request), vec!["a=1"]);
+    }
+
+    #[test]
+    fn leaves_requests_without_cookies_unchanged() {
+        let mut request =
+            RequestHeader::build("GET", b"/echo-cookies", None).expect("valid request header");
+        request
+            .insert_header("x-request-id", "abc")
+            .expect("valid request id header");
+
+        join_cookie_header_fields(&mut request).expect("joining cookies cannot fail");
+
+        assert!(request.headers.get("cookie").is_none());
+        assert_eq!(request.headers.get("x-request-id").unwrap(), "abc");
+    }
+
+    #[test]
+    fn leaves_other_repeated_headers_untouched() {
+        let mut request = request_with_cookie_fields(&["a=1", "b=2"]);
+        request
+            .append_header("x-forwarded-for", "198.51.100.1")
+            .expect("valid forwarded header");
+        request
+            .append_header("x-forwarded-for", "203.0.113.7")
+            .expect("valid forwarded header");
+
+        join_cookie_header_fields(&mut request).expect("joining cookies cannot fail");
+
+        assert_eq!(cookie_values(&request), vec!["a=1; b=2"]);
+        let forwarded: Vec<String> = request
+            .headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            forwarded,
+            vec!["198.51.100.1", "203.0.113.7"],
+            "repeated headers other than cookie must not be joined"
+        );
+    }
+
+    /// The real HTTP/2 request path: three split `cookie` fields arrive as three
+    /// values under one header name, so before the join the upstream request
+    /// carried three `cookie:` lines — and an HTTP/1.1 upstream reads only the
+    /// first one, silently dropping `b=2` and `c=3`. After the join the upstream
+    /// sees a single line carrying all three.
+    #[tokio::test]
+    async fn joins_split_cookie_fields_in_the_http2_header_map() {
+        let mut request = http2_request_with_cookie_fields(&["a=1", "b=2", "c=3"]);
+        assert!(
+            !request.has_case(),
+            "the HTTP/2 downstream shape carries no case-preserving header map"
+        );
+
+        assert_eq!(
+            serialized_cookie_values(&serialize_upstream_request(request.clone()).await),
+            vec!["a=1", "b=2", "c=3"],
+            "precondition: unjoined, the upstream would receive three cookie lines"
+        );
+
+        join_cookie_header_fields(&mut request).expect("joining cookies cannot fail");
+
+        assert_eq!(
+            serialized_cookie_values(&serialize_upstream_request(request).await),
+            vec!["a=1; b=2; c=3"],
+            "the HTTP/2 request must reach the upstream as one joined Cookie header"
+        );
+    }
+
+    /// The acceptance witness: the bytes the upstream HTTP/1.1 server receives
+    /// must contain exactly one `Cookie:` line with the joined value.
+    #[tokio::test]
+    async fn serializes_one_cookie_line_for_the_upstream() {
+        let mut request = request_with_cookie_fields(&["a=1", "b=2", "c=3"]);
+        join_cookie_header_fields(&mut request).expect("joining cookies cannot fail");
+
+        let serialized = serialize_upstream_request(request).await;
+
+        assert_eq!(
+            serialized_cookie_values(&serialized),
+            vec!["a=1; b=2; c=3"],
+            "upstream must receive one joined Cookie header, got: {serialized:?}"
         );
     }
 }
